@@ -65,16 +65,21 @@ def main() -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("navigate"); s.add_argument("url"); s.add_argument("--group-title")
-    s = sub.add_parser("snapshot")
-    s = sub.add_parser("click"); s.add_argument("target"); s.add_argument("--trusted", action="store_true")
-    s = sub.add_parser("fill"); s.add_argument("target"); s.add_argument("value")
-    s = sub.add_parser("evaluate"); s.add_argument("expression")
+    s = sub.add_parser("snapshot"); s.add_argument("--frame")
+    s = sub.add_parser("click"); s.add_argument("target"); s.add_argument("--trusted", action="store_true"); s.add_argument("--frame")
+    s = sub.add_parser("fill"); s.add_argument("target"); s.add_argument("value"); s.add_argument("--frame")
+    s = sub.add_parser("evaluate"); s.add_argument("expression"); s.add_argument("--frame")
     s = sub.add_parser("screenshot"); s.add_argument("--format", default="jpeg", choices=["jpeg", "png"]); s.add_argument("--quality", type=int); s.add_argument("--path"); s.add_argument("--full", action="store_true")
     s = sub.add_parser("network"); s.add_argument("op", choices=["start", "stop", "list", "detail"]); s.add_argument("request_id", nargs="?")
     s = sub.add_parser("record"); s.add_argument("op", choices=["start", "stop", "list", "replay"]); s.add_argument("--name")
-    s = sub.add_parser("extract"); s.add_argument("--mode", default="text", choices=["text", "markdown", "dom"])
-    s = sub.add_parser("press"); s.add_argument("key"); s.add_argument("--selector")
-    s = sub.add_parser("hover"); s.add_argument("target")
+    s = sub.add_parser("extract"); s.add_argument("--mode", default="text", choices=["text", "markdown", "dom"]); s.add_argument("--frame")
+    s = sub.add_parser("press"); s.add_argument("key"); s.add_argument("--selector"); s.add_argument("--frame")
+    s = sub.add_parser("type"); s.add_argument("text"); s.add_argument("--selector"); s.add_argument("--delay", type=int, default=0); s.add_argument("--frame")
+    s = sub.add_parser("wait"); s.add_argument("target", nargs="?"); s.add_argument("--text"); s.add_argument("--state", default="visible", choices=["visible", "gone"]); s.add_argument("--timeout", type=int); s.add_argument("--frame")
+    s = sub.add_parser("wait_new_tab"); s.add_argument("--url"); s.add_argument("--timeout", type=int)
+    s = sub.add_parser("dialog"); s.add_argument("op", choices=["start", "stop"]); s.add_argument("--dismiss", action="store_true"); s.add_argument("--prompt-text")
+    sub.add_parser("frames")
+    s = sub.add_parser("hover"); s.add_argument("target"); s.add_argument("--frame")
     s = sub.add_parser("select"); s.add_argument("target"); s.add_argument("--value"); s.add_argument("--label"); s.add_argument("--index", type=int)
     s = sub.add_parser("scroll"); s.add_argument("--direction", default="down"); s.add_argument("--amount", type=int, default=800); s.add_argument("--selector")
     s = sub.add_parser("tabs")
@@ -91,19 +96,24 @@ def main() -> None:
         # @eN 走 ref，其余按 CSS selector
         return {"ref": t.lstrip("@")} if t.startswith("@") else {"selector": t}
 
+    def frame_args(args: dict) -> dict:
+        if getattr(a, "frame", None):
+            args["frame"] = a.frame
+        return args
+
     if a.cmd == "navigate":
         args = {"url": a.url}
         if a.group_title:
             args["group_title"] = a.group_title
         emit(call("navigate", args, a.session, a.browser))
     elif a.cmd == "snapshot":
-        emit(call("snapshot", {}, a.session, a.browser))
+        emit(call("snapshot", frame_args({}), a.session, a.browser))
     elif a.cmd == "click":
-        emit(call("click", {**target_args(a.target), "trusted": a.trusted}, a.session, a.browser))
+        emit(call("click", frame_args({**target_args(a.target), "trusted": a.trusted}), a.session, a.browser))
     elif a.cmd == "fill":
-        emit(call("fill", {**target_args(a.target), "value": a.value}, a.session, a.browser))
+        emit(call("fill", frame_args({**target_args(a.target), "value": a.value}), a.session, a.browser))
     elif a.cmd == "evaluate":
-        emit(call("evaluate", {"expression": a.expression}, a.session, a.browser))
+        emit(call("evaluate", frame_args({"expression": a.expression}), a.session, a.browser))
     elif a.cmd == "screenshot":
         args = {"format": a.format}
         if a.quality is not None:
@@ -124,11 +134,39 @@ def main() -> None:
             args["name"] = a.name
         emit(call("record", args, a.session, a.browser, timeout=600.0))
     elif a.cmd == "extract":
-        emit(call("extract", {"mode": a.mode}, a.session, a.browser))
+        emit(call("extract", frame_args({"mode": a.mode}), a.session, a.browser))
     elif a.cmd == "press":
-        emit(call("press", {"key": a.key, "selector": a.selector}, a.session, a.browser))
+        emit(call("press", frame_args({"key": a.key, "selector": a.selector}), a.session, a.browser))
+    elif a.cmd == "type":
+        emit(call("type", frame_args({"text": a.text, "selector": a.selector, "delay": a.delay}), a.session, a.browser))
+    elif a.cmd == "wait":
+        args = {"state": a.state}
+        if a.text:
+            args["text"] = a.text
+        elif a.target:
+            args.update(target_args(a.target))
+        if a.timeout:
+            args["timeout"] = a.timeout
+        emit(call("wait", frame_args(args), a.session, a.browser, timeout=(a.timeout or 10000) / 1000 + 30))
+    elif a.cmd == "wait_new_tab":
+        args = {}
+        if a.url:
+            args["url"] = a.url
+        if a.timeout:
+            args["timeout"] = a.timeout
+        emit(call("wait_new_tab", args, a.session, a.browser, timeout=(a.timeout or 10000) / 1000 + 30))
+    elif a.cmd == "dialog":
+        args = {"op": a.op}
+        if a.op == "start":
+            if a.dismiss:
+                args["accept"] = False
+            if a.prompt_text is not None:
+                args["prompt_text"] = a.prompt_text
+        emit(call("dialog", args, a.session, a.browser))
+    elif a.cmd == "frames":
+        emit(call("frames", {}, a.session, a.browser))
     elif a.cmd == "hover":
-        emit(call("hover", target_args(a.target), a.session, a.browser))
+        emit(call("hover", frame_args(target_args(a.target)), a.session, a.browser))
     elif a.cmd == "select":
         emit(call("select", {**target_args(a.target), "value": a.value, "label": a.label, "index": a.index}, a.session, a.browser))
     elif a.cmd == "scroll":

@@ -298,6 +298,43 @@
   }
 
   // -------------------------------------------------------------------------
+  // wait：MutationObserver 监听 DOM 变化，等元素/文本出现或消失，免轮询
+  // -------------------------------------------------------------------------
+
+  function waitFor(msg) {
+    const timeout = Math.min(Number(msg.timeout) || 10000, 60000);
+    const state = msg.state || "visible"; // visible | gone
+    const deadline = Date.now() + timeout;
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        let ok;
+        if (msg.text) {
+          const has = (document.body.innerText || "").includes(msg.text);
+          ok = state === "gone" ? !has : has;
+        } else {
+          let el = null;
+          try { el = resolveEl(msg); } catch { el = null; }
+          ok = state === "gone" ? !el : !!(el && isVisible(el));
+        }
+        if (ok) {
+          obs.disconnect();
+          resolve({ waited: true, state, ...(msg.text ? { text: msg.text } : { target: msg.ref ? "@" + msg.ref : msg.selector }) });
+          return true;
+        }
+        if (Date.now() > deadline) {
+          obs.disconnect();
+          reject(new Error("wait 超时（" + timeout + "ms）：" + (msg.text ? "文本 " + JSON.stringify(msg.text) : (msg.ref ? "@" + msg.ref : msg.selector)) + " 未变为 " + state));
+          return true;
+        }
+        return false;
+      };
+      const obs = new MutationObserver(() => check());
+      if (check()) return;
+      obs.observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true });
+    });
+  }
+
+  // -------------------------------------------------------------------------
   // 消息分发
   // -------------------------------------------------------------------------
 
@@ -333,17 +370,26 @@
           }
           case "scroll": {
             const dir = msg.direction, amt = msg.amount || 800;
-            if (dir === "up") window.scrollBy(0, -amt);
-            else if (dir === "down") window.scrollBy(0, amt);
-            else if (dir === "left") window.scrollBy(-amt, 0);
-            else if (dir === "right") window.scrollBy(amt, 0);
-            else if (dir === "top") window.scrollTo(0, 0);
-            else if (dir === "bottom") window.scrollTo(0, document.documentElement.scrollHeight);
+            // 带目标元素时为容器内滚动（聊天记录、长列表 div），否则滚整个 window
+            const target = (msg.ref || msg.selector) ? resolveEl(msg) : null;
+            const scroller = target
+              ? (target.scrollHeight > target.clientHeight || target.scrollWidth > target.clientWidth ? target : null)
+              : null;
+            if (target && !scroller) throw new Error("目标元素不是可滚动容器");
+            const by = (x, y) => (scroller ? scroller.scrollBy(x, y) : window.scrollBy(x, y));
+            const to = (x, y) => (scroller ? scroller.scrollTo(x, y) : window.scrollTo(x, y));
+            if (dir === "up") by(0, -amt);
+            else if (dir === "down") by(0, amt);
+            else if (dir === "left") by(-amt, 0);
+            else if (dir === "right") by(amt, 0);
+            else if (dir === "top") to(scroller ? scroller.scrollLeft : 0, 0);
+            else if (dir === "bottom") to(scroller ? scroller.scrollLeft : 0, scroller ? scroller.scrollHeight : document.documentElement.scrollHeight);
             else throw new Error("未知滚动方向: " + dir);
-            result = { scrolled: dir, amount: amt };
+            result = { scrolled: dir, amount: amt, container: !!scroller };
             break;
           }
           case "scroll_to": { const el = resolveEl(msg); el.scrollIntoView({ behavior: "instant", block: "center" }); result = { scrolled_to: true }; break; }
+          case "wait": result = await waitFor(msg); break;
           case "extract":
             if (msg.mode === "markdown") result = extractMarkdown();
             else if (msg.mode === "dom") result = extractDom();

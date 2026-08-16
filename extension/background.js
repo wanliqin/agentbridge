@@ -22,6 +22,10 @@ let browserId = null;
 const sessions = new Map();
 // 正在进行网络监听的 tabId → { requests: Map(requestId → entry), order: [requestId] }
 const networkSessions = new Map();
+// 正在自动应答 JS 对话框的 tabId → { accept, promptText }
+const dialogSessions = new Map();
+// session 名 → frameId（最后一次 snapshot 所在 frame，ref 类操作路由回同一 frame）
+const sessionFrames = new Map();
 
 // ---------------------------------------------------------------------------
 // browser_id：随机生成并持久化，多浏览器/多扩展实例借此区分
@@ -122,7 +126,7 @@ async function dispatch(action, args, session) {
     case "list_tabs": return await actListTabs();
     case "close_tab": return await actCloseTab(args, session);
     case "close_session": return await actCloseSession(session);
-    case "snapshot": return await actSnapshot(session);
+    case "snapshot": return await actSnapshot(args, session);
     case "click": return await actClick(args, session);
     case "fill": return await actFill(args, session);
     case "evaluate": return await actEvaluate(args, session);
@@ -137,6 +141,11 @@ async function dispatch(action, args, session) {
     case "scroll": return await actScroll(args, session);
     case "record": return await actRecord(args, session);
     case "extract": return await actExtract(args, session);
+    case "wait": return await actWait(args, session);
+    case "type": return await actType(args, session);
+    case "wait_new_tab": return await actWaitNewTab(args, session);
+    case "dialog": return await actDialog(args, session);
+    case "frames": return await actFrames(args, session);
     default: throw new Error("unknown action: " + action);
   }
 }
@@ -201,6 +210,7 @@ async function setActiveTab(session, tabId) {
 async function actNavigate(args, session) {
   if (!args.url) throw new Error("navigate 需要 args.url");
   const tab = await ensureTab(args, session);
+  sessionFrames.delete(session); // 导航后旧 frame 的 ref 全部失效，路由复位到顶层 frame
   await chrome.tabs.update(tab.id, { url: args.url, active: true });
   // 先等导航真正开始（旧页面的 complete 会造成误判提前返回）
   let cur = tab;
@@ -274,14 +284,14 @@ async function actCloseSession(session) {
 // content.js 消息桥
 // ---------------------------------------------------------------------------
 
-async function sendToContent(tabId, payload) {
+async function sendToContent(tabId, payload, frameId = 0) {
   let resp;
   try {
-    resp = await chrome.tabs.sendMessage(tabId, payload);
+    resp = await chrome.tabs.sendMessage(tabId, payload, { frameId });
   } catch (e) {
     // content script 可能未注入（如刚导航的页面），注入后重试一次
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
-    resp = await chrome.tabs.sendMessage(tabId, payload);
+    await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["content.js"] });
+    resp = await chrome.tabs.sendMessage(tabId, payload, { frameId });
   }
   if (!resp) throw new Error("content.js 无响应");
   if (!resp.ok) throw new Error(resp.error || "content.js 执行失败");
@@ -295,12 +305,44 @@ async function activeTabIdOf(session) {
 }
 
 // ---------------------------------------------------------------------------
+// frame 路由：content.js 以 all_frames 注入每个 iframe。args.frame 可显式指定
+// （frameId、序号或 url 子串）；未指定时沿用该 session 最后一次 snapshot 的
+// frame，保证 @eN ref 能路由回产出它的那个 frame。
+// ---------------------------------------------------------------------------
+
+async function resolveFrameId(tabId, frame) {
+  const frames = (await chrome.webNavigation.getAllFrames({ tabId })) || [];
+  if (!frames.length) throw new Error("无法枚举 tab 的 frame");
+  const raw = String(frame).trim();
+  let f = null;
+  if (/^\d+$/.test(raw)) {
+    const n = Number(raw);
+    f = frames.find((x) => x.frameId === n) || frames[n] || null;
+  } else {
+    f = frames.find((x) => (x.url || "").includes(raw));
+  }
+  if (!f) throw new Error('未找到 frame: ' + raw + '（可用 frames action 查看全部 frame）');
+  return f.frameId;
+}
+
+async function contentTarget(session, args) {
+  const tabId = await activeTabIdOf(session);
+  let frameId = sessionFrames.get(session) || 0;
+  if (args && args.frame !== undefined && args.frame !== null && args.frame !== "") {
+    frameId = await resolveFrameId(tabId, args.frame);
+  }
+  return { tabId, frameId };
+}
+
+// ---------------------------------------------------------------------------
 // 快照 / 点击 / 填充 / 选择 / 滚动 / 提取
 // ---------------------------------------------------------------------------
 
-async function actSnapshot(session) {
-  const tabId = await activeTabIdOf(session);
-  return await sendToContent(tabId, { kind: "snapshot" });
+async function actSnapshot(args, session) {
+  const { tabId, frameId } = await contentTarget(session, args);
+  const result = await sendToContent(tabId, { kind: "snapshot" }, frameId);
+  sessionFrames.set(session, frameId); // 后续 ref 操作路由回这个 frame
+  return { ...result, frameId };
 }
 
 function refOrSelector(args) {
@@ -311,39 +353,166 @@ function refOrSelector(args) {
 }
 
 async function actClick(args, session) {
-  const tabId = await activeTabIdOf(session);
+  const { tabId, frameId } = await contentTarget(session, args);
   const target = refOrSelector(args);
   if (args.trusted) {
     // trusted 模式：content.js 只负责定位和滚动，坐标交给 debugger 发真实输入事件
-    const rect = await sendToContent(tabId, { kind: "coords", ...target });
+    // 注意：CDP 坐标基于顶层视口，iframe 内元素的 trusted 点击坐标会偏移，
+    // iframe 场景请用非 trusted 点击（el.click() 不受此限）
+    const rect = await sendToContent(tabId, { kind: "coords", ...target }, frameId);
     await trustedClickAt(tabId, rect.x, rect.y);
     return { clicked: target, trusted: true, x: rect.x, y: rect.y };
   }
-  return await sendToContent(tabId, { kind: "click", ...target });
+  return await sendToContent(tabId, { kind: "click", ...target }, frameId);
 }
 
 async function actFill(args, session) {
-  const tabId = await activeTabIdOf(session);
+  const { tabId, frameId } = await contentTarget(session, args);
   if (args.value === undefined) throw new Error("fill 需要 args.value");
-  return await sendToContent(tabId, { kind: "fill", ...refOrSelector(args), value: String(args.value) });
+  return await sendToContent(tabId, { kind: "fill", ...refOrSelector(args), value: String(args.value) }, frameId);
 }
 
 async function actSelect(args, session) {
-  const tabId = await activeTabIdOf(session);
-  return await sendToContent(tabId, { kind: "select", ...refOrSelector(args), value: args.value, label: args.label, index: args.index });
+  const { tabId, frameId } = await contentTarget(session, args);
+  return await sendToContent(tabId, { kind: "select", ...refOrSelector(args), value: args.value, label: args.label, index: args.index }, frameId);
 }
 
 async function actScroll(args, session) {
-  const tabId = await activeTabIdOf(session);
+  const { tabId, frameId } = await contentTarget(session, args);
   if (args.selector || args.ref) {
-    return await sendToContent(tabId, { kind: "scroll_to", ...refOrSelector(args) });
+    // 带 direction/amount 时为容器内滚动（聊天记录、长列表 div），否则只是滚到可见
+    if (args.direction || args.amount) {
+      return await sendToContent(tabId, {
+        kind: "scroll", ...refOrSelector(args),
+        direction: args.direction || "down", amount: args.amount || 800,
+      }, frameId);
+    }
+    return await sendToContent(tabId, { kind: "scroll_to", ...refOrSelector(args) }, frameId);
   }
-  return await sendToContent(tabId, { kind: "scroll", direction: args.direction || "down", amount: args.amount || 800 });
+  return await sendToContent(tabId, { kind: "scroll", direction: args.direction || "down", amount: args.amount || 800 }, frameId);
 }
 
 async function actExtract(args, session) {
+  const { tabId, frameId } = await contentTarget(session, args);
+  return await sendToContent(tabId, { kind: "extract", mode: args.mode || "text" }, frameId);
+}
+
+// ---------------------------------------------------------------------------
+// wait：等元素/文本出现或消失（content.js MutationObserver 实现）
+// ---------------------------------------------------------------------------
+
+async function actWait(args, session) {
+  const { tabId, frameId } = await contentTarget(session, args);
+  const payload = { kind: "wait", state: args.state || "visible" };
+  if (args.text) payload.text = String(args.text);
+  else Object.assign(payload, refOrSelector(args));
+  if (args.timeout) payload.timeout = args.timeout;
+  return await sendToContent(tabId, payload, frameId);
+}
+
+// ---------------------------------------------------------------------------
+// type：trusted 逐字符输入（fill 是合成赋值，少数站点能识别）
+// delay>0 时逐字符发 key 事件模拟真人打字；否则 Input.insertText 一次性插入
+// ---------------------------------------------------------------------------
+
+async function actType(args, session) {
+  const { tabId, frameId } = await contentTarget(session, args);
+  if (args.text === undefined || args.text === null) throw new Error("type 需要 args.text");
+  const text = String(args.text);
+  if (args.selector || args.ref) {
+    await sendToContent(tabId, { kind: "focus", ...refOrSelector(args) }, frameId);
+  }
+  const delay = Number(args.delay) || 0;
+  await withDebuggerLocked(tabId, async () => {
+    if (delay <= 0) {
+      await dbgSend(tabId, "Input.insertText", { text });
+      return;
+    }
+    for (const ch of text) {
+      const info = KEY_MAP[ch] || { key: ch, code: ch.length === 1 && /[a-z0-9]/i.test(ch) ? "Key" + ch.toUpperCase() : ch, keyCode: ch.toUpperCase().charCodeAt(0) };
+      await dbgSend(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: info.key, code: info.code, windowsVirtualKeyCode: info.keyCode, text: ch });
+      await dbgSend(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: info.key, code: info.code, windowsVirtualKeyCode: info.keyCode });
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  });
+  return { typed: text.length, trusted: true, delay };
+}
+
+// ---------------------------------------------------------------------------
+// wait_new_tab：click 触发 window.open 后捕获新 tab，并纳入 session 的 tab group
+// ---------------------------------------------------------------------------
+
+async function actWaitNewTab(args, session) {
+  const s = await resolveSession(session).catch(() => null);
+  const timeout = Math.min(Number(args.timeout) || 10000, 60000);
+  const known = new Set((await chrome.tabs.query({})).map((t) => t.id));
+  const tab = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onCreated.removeListener(fn);
+      reject(new Error("wait_new_tab 超时（" + timeout + "ms），没有等到新 tab"));
+    }, timeout);
+    const fn = (t) => {
+      if (known.has(t.id)) return;
+      if (args.url && !((t.url || "") + (t.pendingUrl || "")).includes(args.url)) return;
+      clearTimeout(timer);
+      chrome.tabs.onCreated.removeListener(fn);
+      resolve(t);
+    };
+    chrome.tabs.onCreated.addListener(fn);
+  });
+  let adopted = false;
+  if (s) {
+    try {
+      await chrome.tabs.group({ tabIds: [tab.id], groupId: s.groupId });
+      s.activeTabId = tab.id;
+      adopted = true;
+    } catch { /* group 可能刚被删，仅不收养 */ }
+  }
+  return { tabId: tab.id, url: tab.url || tab.pendingUrl || null, title: tab.title || null, adopted };
+}
+
+// ---------------------------------------------------------------------------
+// dialog：自动应答 alert/confirm/prompt（监听期间保持 attach，与 network 同理）
+// ---------------------------------------------------------------------------
+
+async function actDialog(args, session) {
   const tabId = await activeTabIdOf(session);
-  return await sendToContent(tabId, { kind: "extract", mode: args.mode || "text" });
+  const op = args.op || "start";
+  if (op === "start") {
+    const cfg = { accept: args.accept !== false, promptText: args.prompt_text };
+    if (!dialogSessions.has(tabId)) {
+      await dbgAttach(tabId);
+      try {
+        await dbgSend(tabId, "Page.enable", {});
+      } catch (e) {
+        await dbgDetach(tabId);
+        throw e;
+      }
+    }
+    dialogSessions.set(tabId, cfg);
+    return { started: true, tabId, accept: cfg.accept };
+  }
+  if (op === "stop") {
+    const had = dialogSessions.delete(tabId);
+    // 只有 network 也没在占用 attach 时才 detach
+    if (had && !networkSessions.has(tabId)) await dbgDetach(tabId);
+    return { stopped: true, tabId, was_active: had };
+  }
+  throw new Error("dialog 需要 args.op: start|stop（start 可选 accept / prompt_text）");
+}
+
+// ---------------------------------------------------------------------------
+// frames：列出 session 活跃 tab 的全部 frame（配合 args.frame 使用）
+// ---------------------------------------------------------------------------
+
+async function actFrames(args, session) {
+  const tabId = await activeTabIdOf(session);
+  const frames = (await chrome.webNavigation.getAllFrames({ tabId })) || [];
+  return {
+    count: frames.length,
+    current: sessionFrames.get(session) || 0,
+    frames: frames.map((f) => ({ frameId: f.frameId, url: f.url, parentFrameId: f.parentFrameId })),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -351,13 +520,13 @@ async function actExtract(args, session) {
 // ---------------------------------------------------------------------------
 
 async function actEvaluate(args, session) {
-  const tabId = await activeTabIdOf(session);
+  const { tabId, frameId } = await contentTarget(session, args);
   const expr = args.expression || args.script;
   if (!expr) throw new Error("evaluate 需要 args.expression");
   let results;
   try {
     results = await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, frameIds: [frameId] },
       world: "MAIN",
       func: async (code) => {
         // 间接 eval 在页面 MAIN world 全局作用域执行，await 支持 Promise 返回值
@@ -467,7 +636,8 @@ function dbgDetach(tabId) {
 }
 
 async function withDebugger(tabId, fn) {
-  const persistent = networkSessions.has(tabId); // 网络监听期间的 attach 由 network 生命周期管理
+  // 网络监听 / 对话框自动应答期间的 attach 由各自生命周期管理，不随用随 detach
+  const persistent = networkSessions.has(tabId) || dialogSessions.has(tabId);
   if (!persistent) await dbgAttach(tabId);
   try {
     return await fn();
@@ -488,12 +658,14 @@ function withDebuggerLocked(tabId, fn) {
   return next;
 }
 
-// debugger 被外部断开（如用户点了黄条的"取消"）时清理网络监听状态
+// debugger 被外部断开（如用户点了黄条的"取消"）时清理网络监听/对话框状态
 chrome.debugger.onDetach.addListener((source) => {
   // 用户点黄条"取消"/tab 关闭等活跃期断开：停止监听并同步持久化清单。
   // SW 被挂起导致的自动 detach 不会触发本事件（SW 已不在），持久化清单
   // 会保留下来供 restoreNetworkSessions 恢复。
-  if (source.tabId != null && networkSessions.delete(source.tabId)) persistNetworkTabs();
+  if (source.tabId == null) return;
+  dialogSessions.delete(source.tabId);
+  if (networkSessions.delete(source.tabId)) persistNetworkTabs();
 });
 
 // ---------------------------------------------------------------------------
@@ -531,12 +703,12 @@ const KEY_MAP = {
 const MOD_BITS = { alt: 1, option: 1, control: 2, ctrl: 2, meta: 4, cmd: 4, command: 4, shift: 8 };
 
 async function actPress(args, session) {
-  const tabId = await activeTabIdOf(session);
+  const { tabId, frameId } = await contentTarget(session, args);
   const raw = args.key;
   if (!raw) throw new Error("press 需要 args.key（如 Enter/Escape/Control+A）");
   if (args.selector || args.ref) {
     // 可选先聚焦目标元素，再发键
-    await sendToContent(tabId, { kind: "focus", ...(args.ref ? { ref: String(args.ref).replace(/^@/, "") } : { selector: args.selector }) });
+    await sendToContent(tabId, { kind: "focus", ...refOrSelector(args) }, frameId);
   }
   // 支持组合键："Control+A"、"Shift+Enter"、"Meta+Shift+P"
   const parts = String(raw).split("+").map((p) => p.trim()).filter(Boolean);
@@ -563,8 +735,8 @@ async function actPress(args, session) {
 }
 
 async function actHover(args, session) {
-  const tabId = await activeTabIdOf(session);
-  const rect = await sendToContent(tabId, { kind: "coords", ...refOrSelector(args) });
+  const { tabId, frameId } = await contentTarget(session, args);
+  const rect = await sendToContent(tabId, { kind: "coords", ...refOrSelector(args) }, frameId);
   await withDebuggerLocked(tabId, async () => {
     await dbgSend(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: rect.x, y: rect.y });
     // 轻微抖动模拟真人鼠标轨迹，触发 hover 监听
@@ -579,7 +751,18 @@ async function actHover(args, session) {
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source.tabId;
-  if (tabId == null || !networkSessions.has(tabId)) return;
+  if (tabId == null) return;
+  // JS 对话框自动应答（dialog start 期间保持 attach + Page.enable）
+  if (method === "Page.javascriptDialogOpening") {
+    const cfg = dialogSessions.get(tabId);
+    if (cfg) {
+      const p = { accept: cfg.accept };
+      if (cfg.promptText !== undefined) p.promptText = String(cfg.promptText);
+      dbgSend(tabId, "Page.handleJavaScriptDialog", p).catch(() => {});
+    }
+    return;
+  }
+  if (!networkSessions.has(tabId)) return;
   const buf = networkSessions.get(tabId);
   if (method === "Network.requestWillBeSent") {
     buf.requests.set(params.requestId, {

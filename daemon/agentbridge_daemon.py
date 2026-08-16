@@ -358,8 +358,14 @@ class CommandHandler(BaseHTTPRequestHandler):
             self._send(400, {"code": "BAD_ARGS", "message": "缺少 action 字段"})
             return
 
-        # replay 耗时长（事件数 × 间隔），放宽 HTTP 侧等待
-        wait = 600 if (action == "record" and args.get("op") == "replay") else COMMAND_TIMEOUT + 5
+        # replay 耗时长（事件数 × 间隔），放宽 HTTP 侧等待；
+        # wait / wait_new_tab 按调用方给的 timeout 放宽（扩展端上限 60s）
+        if action == "record" and args.get("op") == "replay":
+            wait = 600
+        elif action in ("wait", "wait_new_tab"):
+            wait = min(args.get("timeout", 10000) / 1000, 60) + 10
+        else:
+            wait = COMMAND_TIMEOUT + 5
         try:
             result = dispatch_sync(action, args, session, browser, timeout=wait)
             self._send(200, {"code": 0, "result": result})

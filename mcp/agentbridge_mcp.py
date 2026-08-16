@@ -81,29 +81,42 @@ def browser_navigate(url: str, session: str = "default", group_title: Optional[s
 
 
 @mcp.tool()
-def browser_snapshot(session: str = "default") -> Dict[str, Any]:
-    """Get an accessibility snapshot of the current page with interactive elements marked by @e refs."""
-    return _call("snapshot", {}, session)
+def browser_snapshot(session: str = "default", frame: Optional[str] = None) -> Dict[str, Any]:
+    """Get an accessibility snapshot of the current page with interactive elements marked by @e refs. frame selects an iframe (frameId, index, or URL substring); defaults to the last snapshotted frame."""
+    args: Dict[str, Any] = {}
+    if frame:
+        args["frame"] = frame
+    return _call("snapshot", args, session)
 
 
 @mcp.tool()
 def browser_click(ref: Optional[str] = None, selector: Optional[str] = None,
-                  trusted: bool = False, session: str = "default") -> Dict[str, Any]:
-    """Click an element by @e ref (from snapshot) or CSS selector. trusted=True sends a real OS-level click via chrome.debugger (isTrusted=true)."""
-    return _call("click", {"ref": ref, "selector": selector, "trusted": trusted}, session)
+                  trusted: bool = False, session: str = "default",
+                  frame: Optional[str] = None) -> Dict[str, Any]:
+    """Click an element by @e ref (from snapshot) or CSS selector. trusted=True sends a real OS-level click via chrome.debugger (isTrusted=true; top-frame coordinates only — use trusted=False inside iframes)."""
+    args: Dict[str, Any] = {"ref": ref, "selector": selector, "trusted": trusted}
+    if frame:
+        args["frame"] = frame
+    return _call("click", args, session)
 
 
 @mcp.tool()
 def browser_fill(value: str, ref: Optional[str] = None, selector: Optional[str] = None,
-                 session: str = "default") -> Dict[str, Any]:
+                 session: str = "default", frame: Optional[str] = None) -> Dict[str, Any]:
     """Fill an input/textarea/contenteditable element (clear-and-insert) by @e ref or CSS selector."""
-    return _call("fill", {"ref": ref, "selector": selector, "value": value}, session)
+    args: Dict[str, Any] = {"ref": ref, "selector": selector, "value": value}
+    if frame:
+        args["frame"] = frame
+    return _call("fill", args, session)
 
 
 @mcp.tool()
-def browser_evaluate(expression: str, session: str = "default") -> Dict[str, Any]:
+def browser_evaluate(expression: str, session: str = "default", frame: Optional[str] = None) -> Dict[str, Any]:
     """Evaluate a JavaScript expression in the page MAIN world (async/await supported)."""
-    return _call("evaluate", {"expression": expression}, session)
+    args: Dict[str, Any] = {"expression": expression}
+    if frame:
+        args["frame"] = frame
+    return _call("evaluate", args, session)
 
 
 @mcp.tool()
@@ -145,8 +158,63 @@ def browser_select(ref: Optional[str] = None, selector: Optional[str] = None,
 @mcp.tool()
 def browser_scroll(direction: str = "down", amount: int = 800,
                    selector: Optional[str] = None, session: str = "default") -> Dict[str, Any]:
-    """Scroll the page (up/down/left/right/top/bottom) or scroll an element into view."""
+    """Scroll the page (up/down/left/right/top/bottom). With selector, scrolls inside that container instead (chat history, long list divs)."""
     return _call("scroll", {"direction": direction, "amount": amount, "selector": selector}, session)
+
+
+@mcp.tool()
+def browser_wait(ref: Optional[str] = None, selector: Optional[str] = None,
+                 text: Optional[str] = None, state: str = "visible",
+                 timeout: int = 10000, session: str = "default",
+                 frame: Optional[str] = None) -> Dict[str, Any]:
+    """Wait for an element (@e ref / CSS selector) or text to appear (state=visible) or disappear (state=gone), via MutationObserver — no polling."""
+    args: Dict[str, Any] = {"state": state, "timeout": timeout}
+    if text:
+        args["text"] = text
+    else:
+        args.update({"ref": ref, "selector": selector})
+    if frame:
+        args["frame"] = frame
+    return _call("wait", args, session, timeout=min(timeout / 1000, 60) + 30)
+
+
+@mcp.tool()
+def browser_type(text: str, ref: Optional[str] = None, selector: Optional[str] = None,
+                 delay: int = 0, session: str = "default",
+                 frame: Optional[str] = None) -> Dict[str, Any]:
+    """Type text as trusted keyboard input (fill uses synthetic value-setting which some sites detect). delay>0 types char-by-char like a human; delay=0 uses atomic Input.insertText. Optionally focuses ref/selector first."""
+    args: Dict[str, Any] = {"text": text, "ref": ref, "selector": selector, "delay": delay}
+    if frame:
+        args["frame"] = frame
+    return _call("type", args, session, timeout=max(60.0, len(text) * max(delay, 1) / 1000 + 30))
+
+
+@mcp.tool()
+def browser_wait_new_tab(url: Optional[str] = None, timeout: int = 10000,
+                         session: str = "default") -> Dict[str, Any]:
+    """Wait for a new tab to open (e.g. after a click that triggers window.open). The new tab is adopted into the session's tab group and becomes the active tab. url filters by substring."""
+    args: Dict[str, Any] = {"timeout": timeout}
+    if url:
+        args["url"] = url
+    return _call("wait_new_tab", args, session, timeout=min(timeout / 1000, 60) + 30)
+
+
+@mcp.tool()
+def browser_dialog(op: str = "start", accept: bool = True, prompt_text: Optional[str] = None,
+                   session: str = "default") -> Dict[str, Any]:
+    """Auto-answer JavaScript dialogs (alert/confirm/prompt) so they don't block automation. op=start keeps a debugger attached and auto-accepts (accept=False dismisses; prompt_text fills prompts); op=stop detaches."""
+    args: Dict[str, Any] = {"op": op}
+    if op == "start":
+        args["accept"] = accept
+        if prompt_text is not None:
+            args["prompt_text"] = prompt_text
+    return _call("dialog", args, session)
+
+
+@mcp.tool()
+def browser_frames(session: str = "default") -> Dict[str, Any]:
+    """List all frames (iframes) of the session's active tab. Use frame values with other tools' frame parameter."""
+    return _call("frames", {}, session)
 
 
 @mcp.tool()

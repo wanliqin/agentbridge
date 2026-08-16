@@ -54,10 +54,15 @@ launchd 拉起的进程以 launchd 为责任主体，**没有 ~/Documents 的 TC
 | `list_tabs` | — | 全部 tab（含 group 信息） |
 | `close_tab` | `tab_id?` | 关指定/活跃 tab |
 | `close_session` | — | 关整个 tab group |
-| `snapshot` | — | a11y 文本树，元素打 `@eN` ref |
-| `click` | `ref`/`selector`, `trusted?` | 默认 synthetic；`trusted=true` 走 debugger 真实点击 |
-| `fill` | `ref`/`selector`, `value` | input/textarea/contenteditable，clear-and-insert |
-| `evaluate` | `expression` | MAIN world，支持 async/await，returnByValue |
+| `snapshot` | `frame?` | a11y 文本树，元素打 `@eN` ref；穿透 open shadow DOM；`frame` 指定 iframe（frameId/序号/url 子串） |
+| `click` | `ref`/`selector`, `trusted?`, `frame?` | 默认 synthetic；`trusted=true` 走 debugger 真实点击（坐标基于顶层视口，iframe 内请用 synthetic） |
+| `fill` | `ref`/`selector`, `value`, `frame?` | input/textarea/contenteditable，clear-and-insert |
+| `type` | `text`, `ref`/`selector?`, `delay?`, `frame?` | **trusted** 键盘输入；`delay>0` 逐字符模拟真人打字，`delay=0` 用 `Input.insertText` |
+| `wait` | `ref`/`selector` 或 `text`, `state?`, `timeout?` | MutationObserver 等元素/文本出现（visible）或消失（gone），免轮询 |
+| `wait_new_tab` | `url?`, `timeout?` | 等 `window.open` 新 tab，自动纳入 session 的 tab group 并设为活跃 |
+| `dialog` | `op=start|stop`, `accept?`, `prompt_text?` | 自动应答 alert/confirm/prompt，防止自动化被对话框卡死 |
+| `frames` | — | 列出活跃 tab 的全部 frame（配合 `frame` 参数使用） |
+| `evaluate` | `expression`, `frame?` | MAIN world，支持 async/await，returnByValue |
 | `screenshot` | `format`, `quality?`, `path?`, `full?` | 存 `~/.agentbridge/screenshots/` 或指定路径；`full=true` 走 CDP 截全页 |
 | `upload` | `selector`, `files[]` | debugger `DOM.setFileInputFiles` |
 | `save_as_pdf` | `path?`, `landscape?` | debugger `Page.printToPDF` |
@@ -66,7 +71,7 @@ launchd 拉起的进程以 launchd 为责任主体，**没有 ~/Documents 的 TC
 | `press` | `key`, `selector?` | **trusted** 键盘事件（可选先聚焦）；支持组合键 `Control+A`/`Shift+Enter` |
 | `hover` | `ref`/`selector` | **trusted** 悬停 |
 | `select` | `ref`/`selector`, `value`/`label`/`index` | 下拉框选值 |
-| `scroll` | `direction`, `amount` 或 `selector` | 滚动 |
+| `scroll` | `direction`, `amount` 或 `selector` | 滚动窗口；带 `selector`+`direction` 时为容器内滚动（聊天记录、长列表 div） |
 | `record` | `op=start|stop|list|replay`, `name?` | 录制存 `~/.agentbridge/recordings/<name>.json`；replay 用 trusted 点击回放 |
 | `extract` | `mode=text|markdown|dom` | 正文提取 / 转 markdown / 完整渲染 DOM |
 
@@ -118,15 +123,15 @@ agentbridge close session --session demo
 }
 ```
 
-tools：`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_fill` / `browser_evaluate` / `browser_screenshot` / `browser_press` / `browser_hover` / `browser_select` / `browser_scroll` / `browser_extract` / `browser_network` / `browser_record` / `browser_tabs` / `browser_find_tab` / `browser_close_tab` / `browser_close_session` / `browser_upload` / `browser_save_as_pdf` / `browser_cdp` / `browser_status`。
+tools：`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_fill` / `browser_type` / `browser_wait` / `browser_wait_new_tab` / `browser_dialog` / `browser_frames` / `browser_evaluate` / `browser_screenshot` / `browser_press` / `browser_hover` / `browser_select` / `browser_scroll` / `browser_extract` / `browser_network` / `browser_record` / `browser_tabs` / `browser_find_tab` / `browser_close_tab` / `browser_close_session` / `browser_upload` / `browser_save_as_pdf` / `browser_cdp` / `browser_status`。
 
 ## chrome.debugger 黄条说明
 
 `chrome.debugger` attach 时浏览器顶部会出现"正在调试此浏览器"黄条。AgentBridge 的纪律：
 
-- `network start` 后**保持 attach**（监听必需），`network stop` 立即 detach；
-- trusted 输入 / PDF / CDP 透传**按需 attach，用完即 detach**，黄条只闪现；
-- 用户手动点黄条"取消"会导致正在进行的网络监听失效（状态自动清理，可重新 start）。
+- `network start` / `dialog start` 后**保持 attach**（监听必需），对应 `stop` 立即 detach；
+- trusted 输入 / PDF / CDP 透传**按需 attach，用完即 detach**（同 tab 自动串行排队），黄条只闪现；
+- 用户手动点黄条"取消"会导致正在进行的网络监听/对话框应答失效（状态自动清理，可重新 start）。
 
 ## token 安全
 
@@ -138,6 +143,8 @@ tools：`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_fil
 ## 已知限制
 
 - 快照只覆盖视口上下约两屏内的可交互元素（控制体积）；
+- closed shadow root 无法穿透（平台限制）；
+- iframe 内元素的 **trusted** 点击/悬停坐标基于顶层视口会偏移，iframe 内请用 synthetic 点击；
 - `record` 不录制密码框实际值（落盘为 `***`），replay 无法还原密码输入；
 - replay 按 selector 回放，页面结构大变后可能失败；
 - 扩展 SW 被回收后 session 映射按 tab group 标题重建，手动改组名会导致 session 失联。
