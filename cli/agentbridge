@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""AgentBridge CLI — 命令行封装 daemon HTTP 接口，输出 JSON。
+
+用法示例：
+  agentbridge navigate https://example.com
+  agentbridge snapshot
+  agentbridge click @e3 --trusted
+  agentbridge fill @e5 "hello"
+  agentbridge network start / list / stop / detail <requestId>
+  agentbridge record start --name login / stop --name login / replay --name login / list
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+DAEMON_URL = "http://127.0.0.1:10088/command"
+IDENTITY_FILE = Path.home() / ".agentbridge" / "identity.json"
+
+
+def token() -> str:
+    try:
+        return json.loads(IDENTITY_FILE.read_text())["token"]
+    except Exception:
+        print(json.dumps({"code": "NO_TOKEN", "message": f"无法读取 {IDENTITY_FILE}，请先运行 scripts/install.sh"}))
+        sys.exit(2)
+
+
+def call(action: str, args: dict, session: str, browser: str | None, timeout: float = 60.0) -> dict:
+    body = {"action": action, "args": args, "session": session}
+    if browser:
+        body["browser"] = browser
+    req = urllib.request.Request(
+        DAEMON_URL,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token()}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode("utf-8"))
+        except json.JSONDecodeError:
+            return {"code": f"HTTP_{e.code}", "message": e.reason}
+    except urllib.error.URLError as e:
+        return {"code": "NO_DAEMON", "message": f"无法连接 daemon（127.0.0.1:10088），请先启动: {e.reason}"}
+
+
+def emit(payload: dict) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    sys.exit(0 if payload.get("code") == 0 else 1)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="agentbridge", description="AgentBridge 浏览器控制 CLI")
+    p.add_argument("--session", default="default", help="session 名（一个 session = 一个 tab group）")
+    p.add_argument("--browser", default=None, help="目标 browser_id（多浏览器时指定）")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("navigate"); s.add_argument("url"); s.add_argument("--group-title")
+    s = sub.add_parser("snapshot")
+    s = sub.add_parser("click"); s.add_argument("target"); s.add_argument("--trusted", action="store_true")
+    s = sub.add_parser("fill"); s.add_argument("target"); s.add_argument("value")
+    s = sub.add_parser("evaluate"); s.add_argument("expression")
+    s = sub.add_parser("screenshot"); s.add_argument("--format", default="jpeg", choices=["jpeg", "png"]); s.add_argument("--quality", type=int); s.add_argument("--path"); s.add_argument("--full", action="store_true")
+    s = sub.add_parser("network"); s.add_argument("op", choices=["start", "stop", "list", "detail"]); s.add_argument("request_id", nargs="?")
+    s = sub.add_parser("record"); s.add_argument("op", choices=["start", "stop", "list", "replay"]); s.add_argument("--name")
+    s = sub.add_parser("extract"); s.add_argument("--mode", default="text", choices=["text", "markdown", "dom"])
+    s = sub.add_parser("press"); s.add_argument("key"); s.add_argument("--selector")
+    s = sub.add_parser("hover"); s.add_argument("target")
+    s = sub.add_parser("select"); s.add_argument("target"); s.add_argument("--value"); s.add_argument("--label"); s.add_argument("--index", type=int)
+    s = sub.add_parser("scroll"); s.add_argument("--direction", default="down"); s.add_argument("--amount", type=int, default=800); s.add_argument("--selector")
+    s = sub.add_parser("tabs")
+    s = sub.add_parser("find_tab"); s.add_argument("--url"); s.add_argument("--title")
+    s = sub.add_parser("close"); s.add_argument("what", choices=["tab", "session"]); s.add_argument("--tab-id", type=int)
+    s = sub.add_parser("upload"); s.add_argument("selector"); s.add_argument("files", nargs="+")
+    s = sub.add_parser("pdf"); s.add_argument("--path"); s.add_argument("--landscape", action="store_true")
+    s = sub.add_parser("cdp"); s.add_argument("method"); s.add_argument("--params", default="{}")
+    sub.add_parser("status")
+
+    a = p.parse_args()
+
+    def target_args(t: str) -> dict:
+        # @eN 走 ref，其余按 CSS selector
+        return {"ref": t.lstrip("@")} if t.startswith("@") else {"selector": t}
+
+    if a.cmd == "navigate":
+        args = {"url": a.url}
+        if a.group_title:
+            args["group_title"] = a.group_title
+        emit(call("navigate", args, a.session, a.browser))
+    elif a.cmd == "snapshot":
+        emit(call("snapshot", {}, a.session, a.browser))
+    elif a.cmd == "click":
+        emit(call("click", {**target_args(a.target), "trusted": a.trusted}, a.session, a.browser))
+    elif a.cmd == "fill":
+        emit(call("fill", {**target_args(a.target), "value": a.value}, a.session, a.browser))
+    elif a.cmd == "evaluate":
+        emit(call("evaluate", {"expression": a.expression}, a.session, a.browser))
+    elif a.cmd == "screenshot":
+        args = {"format": a.format}
+        if a.quality is not None:
+            args["quality"] = a.quality
+        if a.path:
+            args["path"] = a.path
+        if a.full:
+            args["full"] = True
+        emit(call("screenshot", args, a.session, a.browser))
+    elif a.cmd == "network":
+        args = {"op": a.op}
+        if a.request_id:
+            args["request_id"] = a.request_id
+        emit(call("network", args, a.session, a.browser))
+    elif a.cmd == "record":
+        args = {"op": a.op}
+        if a.name:
+            args["name"] = a.name
+        emit(call("record", args, a.session, a.browser, timeout=600.0))
+    elif a.cmd == "extract":
+        emit(call("extract", {"mode": a.mode}, a.session, a.browser))
+    elif a.cmd == "press":
+        emit(call("press", {"key": a.key, "selector": a.selector}, a.session, a.browser))
+    elif a.cmd == "hover":
+        emit(call("hover", target_args(a.target), a.session, a.browser))
+    elif a.cmd == "select":
+        emit(call("select", {**target_args(a.target), "value": a.value, "label": a.label, "index": a.index}, a.session, a.browser))
+    elif a.cmd == "scroll":
+        emit(call("scroll", {"direction": a.direction, "amount": a.amount, "selector": a.selector}, a.session, a.browser))
+    elif a.cmd == "tabs":
+        emit(call("list_tabs", {}, a.session, a.browser))
+    elif a.cmd == "find_tab":
+        emit(call("find_tab", {"url": a.url, "title": a.title}, a.session, a.browser))
+    elif a.cmd == "close":
+        if a.what == "tab":
+            emit(call("close_tab", {"tab_id": a.tab_id}, a.session, a.browser))
+        else:
+            emit(call("close_session", {}, a.session, a.browser))
+    elif a.cmd == "upload":
+        emit(call("upload", {"selector": a.selector, "files": a.files}, a.session, a.browser))
+    elif a.cmd == "pdf":
+        emit(call("save_as_pdf", {"path": a.path, "landscape": a.landscape}, a.session, a.browser))
+    elif a.cmd == "cdp":
+        emit(call("cdp", {"method": a.method, "params": json.loads(a.params)}, a.session, a.browser))
+    elif a.cmd == "status":
+        emit(call("status", {}, a.session, a.browser))
+
+
+if __name__ == "__main__":
+    main()

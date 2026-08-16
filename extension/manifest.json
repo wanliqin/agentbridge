@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "AgentBridge",
+  "version": "1.0.0",
+  "description": "通用 AI 浏览器控制插件：WebSocket 出站连接本地 daemon，提供快照/点击/填表/截图/网络监听/录制回放/trusted 输入等能力。",
+  "minimum_chrome_version": "120",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "scripting",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

@@ -1,0 +1,6 @@
+# 含本机 token，由 scripts/install.sh 生成，绝不入库
+extension/config.js
+
+__pycache__/
+*.pyc
+.DS_Store
