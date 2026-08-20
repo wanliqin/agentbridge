@@ -189,8 +189,20 @@ async function ensureTab(args, session) {
     } catch { /* tab 已被手动关掉，重建 */ }
   }
   // 新 tab 先落在 about:blank，由 actNavigate 统一 tabs.update 导航，
-  // 避免 create 带 url 后又 update 同 url 造成重复加载
-  const tab = await chrome.tabs.create({ url: "about:blank", active: true });
+  // 避免 create 带 url 后又 update 同 url 造成重复加载。
+  // headless 下所有 tab 被关光后不存在 "current window"，
+  // chrome.tabs.create 会报 "No current window" —— 先补一个窗口。
+  let tab;
+  try {
+    tab = await chrome.tabs.create({ url: "about:blank", active: true });
+  } catch (e) {
+    if (String(e && e.message).includes("No current window")) {
+      const win = await chrome.windows.create({ url: "about:blank", focused: true });
+      tab = win.tabs[0];
+    } else {
+      throw e;
+    }
+  }
   const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
   const title = args.group_title || session;
   await chrome.tabGroups.update(groupId, { title });
