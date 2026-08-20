@@ -10,6 +10,8 @@ importScripts("config.js"); // 提供 AGENTBRIDGE_TOKEN / AGENTBRIDGE_WS_URL
 // ---------------------------------------------------------------------------
 
 const WS_URL = (typeof AGENTBRIDGE_WS_URL !== "undefined" && AGENTBRIDGE_WS_URL) || "ws://127.0.0.1:10089/";
+// daemon 的 HTTP 端口（/command、/file）；config.js 可用 AGENTBRIDGE_HTTP_URL 覆盖
+const HTTP_URL = (typeof AGENTBRIDGE_HTTP_URL !== "undefined" && AGENTBRIDGE_HTTP_URL) || "http://127.0.0.1:10088";
 const TOKEN = (typeof AGENTBRIDGE_TOKEN !== "undefined" && AGENTBRIDGE_TOKEN) || "";
 const KEEPALIVE_ALARM = "agentbridge-keepalive";
 
@@ -602,18 +604,87 @@ async function actSaveAsPdf(args, session) {
   return { format: "pdf", base64: data.data, path: args.path || null };
 }
 
+function arrayBufferToBase64(buf) {
+  // 分片转字符串，避免 fromCharCode 大数组参数溢出
+  const bytes = new Uint8Array(buf);
+  let s = "";
+  const STEP = 0x8000;
+  for (let i = 0; i < bytes.length; i += STEP) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + STEP));
+  }
+  return btoa(s);
+}
+
 async function actUpload(args, session) {
-  const tabId = await activeTabIdOf(session);
+  const { tabId, frameId } = await contentTarget(session, args);
   if (!args.selector || !Array.isArray(args.files) || !args.files.length) {
     throw new Error("upload 需要 args.selector 和 args.files（绝对路径数组）");
   }
-  return await withDebuggerLocked(tabId, async () => {
-    const doc = await dbgSend(tabId, "DOM.getDocument", { depth: 1 });
-    const node = await dbgSend(tabId, "DOM.querySelector", { nodeId: doc.root.nodeId, selector: args.selector });
-    if (!node.nodeId) throw new Error("未找到文件输入框: " + args.selector);
-    await dbgSend(tabId, "DOM.setFileInputFiles", { files: args.files, nodeId: node.nodeId });
-    return { uploaded: args.files, selector: args.selector };
+  // chrome.debugger 会话被 Chromium 禁止调 DOM.setFileInputFiles（Not allowed），
+  // 改走合成注入：daemon /file 读本地字节 → base64 分块搬进页面 → MAIN world
+  // 构造 File + DataTransfer 赋给 input.files 并派发 input/change
+  const files = [];
+  for (const path of args.files) {
+    const resp = await fetch(HTTP_URL + "/file?path=" + encodeURIComponent(path), {
+      headers: { Authorization: "Bearer " + TOKEN },
+    });
+    if (!resp.ok) throw new Error("daemon 读取文件失败: " + path + "（HTTP " + resp.status + "）");
+    const buf = await resp.arrayBuffer();
+    files.push({ name: String(path).split("/").pop(), b64: arrayBufferToBase64(buf) });
+  }
+  const meta = files.map((f) => ({ name: f.name, len: f.b64.length }));
+
+  await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [frameId] }, world: "MAIN",
+    func: () => { window.__abUploadChunks = []; },
   });
+  const CHUNK = 8 * 1024 * 1024; // 单条 executeScript 参数不宜过大，8MB 分块
+  for (const f of files) {
+    for (let i = 0; i < f.b64.length; i += CHUNK) {
+      const piece = f.b64.slice(i, i + CHUNK);
+      await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [frameId] }, world: "MAIN",
+        func: (p) => { window.__abUploadChunks.push(p); },
+        args: [piece],
+      });
+    }
+  }
+  // 关键：必须用 actEvaluate 同款的 eval 间接求值注入。实测直接 func 注入时
+  // DataTransfer/items.add 在该页面上静默失效（原因未明，可能与 Vue 环境有关），
+  // eval 风格则完全正常
+  const finalCode = `(function(){ const selector = ${JSON.stringify(args.selector)}; const fileMeta = ${JSON.stringify(meta)};
+    const input = document.querySelector(selector);
+    if (!input || input.tagName !== "INPUT" || (input.type || "").toLowerCase() !== "file") {
+      throw new Error("未找到文件输入框: " + selector);
+    }
+    const all = window.__abUploadChunks.join("");
+    const dt = new DataTransfer();
+    let off = 0;
+    for (const m of fileMeta) {
+      const bin = atob(all.slice(off, off + m.len));
+      off += m.len;
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      dt.items.add(new File([bytes], m.name));
+    }
+    const files = Array.from(dt.files).map((f) => f.name + ":" + f.size);
+    input.files = dt.files;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    window.__abUploadChunks = [];
+    return files; })()`;
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [frameId] }, world: "MAIN",
+    func: async (code) => {
+      const r = await (0, eval)(code);
+      try { return JSON.parse(JSON.stringify(r === undefined ? null : r)); }
+      catch { return String(r); }
+    },
+    args: [finalCode],
+  });
+  const r = results && results[0];
+  if (!r || (r.result === undefined && !r.error)) throw new Error("upload 注入无结果");
+  return { uploaded: args.files, selector: args.selector, files: r.result || [] };
 }
 
 // ---------------------------------------------------------------------------
@@ -892,7 +963,25 @@ async function actNetwork(args, session) {
 async function actCdp(args, session) {
   const tabId = await activeTabIdOf(session);
   if (!args.method) throw new Error("cdp 需要 args.method");
-  const result = await withDebuggerLocked(tabId, () => dbgSend(tabId, args.method, args.params || {}));
+  const result = await withDebuggerLocked(tabId, async () => {
+    const params = { ...(args.params || {}) };
+    // DOM.querySelector/All 不传 nodeId 时自动从文档根查（同一次调用内完成
+    // getDocument→querySelector）。nodeId 只在产出它的那次 getDocument 的 id 空间
+    // 内有效，跨调用复用旧 id 必报 "Could not find node with given id"
+    if ((args.method === "DOM.querySelector" || args.method === "DOM.querySelectorAll") && params.nodeId == null) {
+      const doc = await dbgSend(tabId, "DOM.getDocument", { depth: 1 });
+      params.nodeId = doc.root.nodeId;
+    }
+    try {
+      return await dbgSend(tabId, args.method, params);
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      if (/Could not find node/.test(msg)) {
+        throw new Error(msg + "（nodeId 只在同一次 DOM.getDocument 内有效，跨调用复用旧 id 必失效；DOM.querySelector/All 不传 nodeId 即可自动从文档根查询）");
+      }
+      throw e;
+    }
+  });
   return { method: args.method, result };
 }
 

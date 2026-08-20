@@ -334,7 +334,35 @@ class CommandHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send(200, {"code": 0, "result": {"status": "ok", "browsers": len(extensions)}})
             return
+        if self.path.startswith("/file"):
+            self._serve_file()
+            return
         self._send(404, {"code": "NOT_FOUND", "message": "仅支持 POST /command"})
+
+    def _serve_file(self):
+        """GET /file?path=<绝对路径>：供扩展拉取本地文件字节（browser_upload 用）。
+        chrome.debugger 会话被 Chromium 禁止调 DOM.setFileInputFiles（Not allowed），
+        文件经此通道交给扩展合成注入页面。"""
+        if not self._authorized():
+            self._send(401, {"code": "UNAUTHORIZED", "message": "token 无效，请检查 ~/.agentbridge/identity.json"})
+            return
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        path = (query.get("path") or [""])[0]
+        p = Path(path)
+        if not path or not p.is_absolute() or not p.is_file():
+            self._send(404, {"code": "NOT_FOUND", "message": f"文件不存在或不是绝对路径: {path}"})
+            return
+        try:
+            data = p.read_bytes()
+        except Exception as e:
+            self._send(500, {"code": "READ_ERROR", "message": f"读取文件失败: {e}"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        log.info("已通过 /file 提供文件: %s（%d 字节）", path, len(data))
 
     def do_POST(self):
         if self.path != "/command":

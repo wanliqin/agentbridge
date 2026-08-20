@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AgentBridge",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "通用 AI 浏览器控制插件：WebSocket 出站连接本地 daemon，提供快照/点击/填表/截图/网络监听/录制回放/trusted 输入等能力。",
   "minimum_chrome_version": "120",
   "permissions": [

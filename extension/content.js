@@ -249,6 +249,40 @@
   // 输出文本化 a11y 树
   // -------------------------------------------------------------------------
 
+  const MAX_CLICKABLE = 60; // cursor:pointer 候选的收录上限，控制快照体积
+
+  // 图标字体按钮无语义名时，从 i/svg 子元素 class 提取（_icon-edit → icon:edit）
+  function iconName(el) {
+    const icon = el.querySelector && el.querySelector("i[class*='icon'], svg[class], span[class*='icon']");
+    const src = icon || (/icon/i.test(String(el.className || "")) ? el : null);
+    if (!src) return "";
+    for (const t of classTokens(src)) {
+      const m = t.match(/icon[-_]([a-z0-9][a-z0-9-]*)/i) || t.match(/^fa-([a-z0-9-]+)/i);
+      if (m && m[1] && !/^(font|s)$/i.test(m[1])) return "icon:" + m[1];
+    }
+    return "";
+  }
+
+  // cursor:pointer 是通用可点击信号（自定义菜单项、表格行、图标容器）；
+  // 跳过整屏级容器（纯布局壳），其余交给"已列出祖先"去重
+  function isClickableCandidate(el) {
+    if (el.tagName === "BODY" || el.tagName === "HTML") return false;
+    if (window.getComputedStyle(el).cursor !== "pointer") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width * rect.height <= window.innerWidth * window.innerHeight * 0.9;
+  }
+
+  // 祖先（含 shadow host 链）已在本轮快照列出则跳过——cursor 会继承，
+  // 不收已列出元素的内部碎片
+  function hasListedAncestor(el) {
+    let cur = el.parentElement || (el.getRootNode && el.getRootNode().host);
+    while (cur && cur !== document.body) {
+      if (cur.hasAttribute && cur.hasAttribute("data-ai-ref")) return true;
+      cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host);
+    }
+    return false;
+  }
+
   function buildSnapshot() {
     for (const el of walkElements(document.body)) {
       if (el.hasAttribute("data-ai-ref")) el.removeAttribute("data-ai-ref");
@@ -258,6 +292,8 @@
     const refs = [];
     let counter = 1;
     let hasInferred = false;
+    let clickableCount = 0;
+    let clickableTruncated = false;
 
     for (const node of walkElements(document.body)) {
       if (!isVisible(node)) continue;
@@ -277,9 +313,16 @@
       const role = getRole(node);
       // 被自定义包装（label 等）代表的勾选 input 不再单独列行，避免与控件根重复
       if (node.tagName === "INPUT" && checkableKind(node) && controlRootFor(node) !== node) continue;
-      const interactive = INTERACTIVE_TAGS.has(node.tagName) || INTERACTIVE_ROLES.has(role);
+      let interactive = INTERACTIVE_TAGS.has(node.tagName) || INTERACTIVE_ROLES.has(role);
+      if (!interactive && clickableCount < MAX_CLICKABLE
+          && isClickableCandidate(node) && !hasListedAncestor(node)) {
+        interactive = true; // cursor:pointer 候选按可交互元素收录
+        clickableCount++;
+      } else if (!interactive && isClickableCandidate(node) && !hasListedAncestor(node)) {
+        clickableTruncated = true;
+      }
       if (!interactive) continue;
-      const name = getName(node);
+      const name = getName(node) || iconName(node);
       if (!name && node.tagName !== "INPUT" && node.tagName !== "TEXTAREA") continue;
       const ref = "e" + counter++;
       node.setAttribute("data-ai-ref", ref);
@@ -290,6 +333,7 @@
       refs.push({ ref, role, tag: node.tagName.toLowerCase(), name });
     }
     if (hasInferred) lines.push("（勾选状态带 ? 为多信号推断值）");
+    if (clickableTruncated) lines.push(`（可点击元素超出 ${MAX_CLICKABLE} 条上限，已截断；可用 selector 精确定位）`);
     return { snapshot: lines.join("\n"), element_count: refs.length, url: location.href, title: document.title };
   }
 
@@ -466,6 +510,15 @@
         }
         if (tag === "BLOCKQUOTE") { if (text) lines.push("> " + text.replace(/\n/g, "\n> ")); continue; }
         if (tag === "PRE") { if (text) lines.push("```\n" + text + "\n```"); continue; }
+        if (tag === "TABLE") {
+          // 表格按行展开为 md 管道行，日志/列表页的主体内容常在 table 里
+          node.querySelectorAll("tr").forEach((tr) => {
+            const cells = Array.from(tr.querySelectorAll("th,td"))
+              .map((c) => (c.innerText || "").trim().replace(/\s*\n\s*/g, " "));
+            if (cells.some(Boolean)) lines.push("| " + cells.join(" | ") + " |");
+          });
+          continue;
+        }
         if (["DIV", "SECTION", "ARTICLE", "MAIN"].includes(tag)) walk(node);
       }
     };

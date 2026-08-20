@@ -36,9 +36,9 @@ def _token() -> str:
         raise RuntimeError(f"无法读取 token（{IDENTITY_FILE}），请先运行 scripts/install.sh: {e}")
 
 
-def _call(action: str, args: Optional[Dict[str, Any]] = None, session: str = "default",
-          browser: Optional[str] = None, timeout: float = 60.0) -> Dict[str, Any]:
-    """统一调用 daemon，错误格式 {code, message} 转为可读报错。"""
+def _request(action: str, args: Optional[Dict[str, Any]] = None, session: str = "default",
+             browser: Optional[str] = None, timeout: float = 60.0) -> Dict[str, Any]:
+    """实际调用 daemon，错误格式 {code, message} 转为可读报错。"""
     body: Dict[str, Any] = {"action": action, "args": args or {}, "session": session}
     if browser:
         body["browser"] = browser
@@ -60,6 +60,17 @@ def _call(action: str, args: Optional[Dict[str, Any]] = None, session: str = "de
     except urllib.error.URLError as e:
         raise RuntimeError(f"无法连接 daemon（127.0.0.1:10088），请先启动 daemon/agentbridge_daemon.py: {e.reason}")
     return payload.get("result")
+
+
+def _call(action: str, args: Optional[Dict[str, Any]] = None, session: str = "default",
+          browser: Optional[str] = None, timeout: float = 60.0) -> Dict[str, Any]:
+    """工具统一入口：任何错误（含 daemon 不可达、扩展报错）都包装成结构化
+    结果返回，绝不向上抛异常——transport 级异常会让 MCP 客户端误判 server
+    不可用而熔断整个 server。"""
+    try:
+        return _request(action, args, session, browser, timeout)
+    except Exception as e:
+        return {"ok": False, "action": action, "error": str(e)}
 
 
 mcp = FastMCP("agentbridge")
@@ -282,7 +293,8 @@ def browser_save_as_pdf(path: Optional[str] = None, landscape: bool = False,
 @mcp.tool()
 def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None,
                 session: str = "default") -> Dict[str, Any]:
-    """Raw CDP passthrough via chrome.debugger: any method + params."""
+    """Raw CDP passthrough via chrome.debugger: any method + params.
+    DOM.querySelector/DOM.querySelectorAll can omit params.nodeId — the document root is resolved automatically in the same call. NOTE: nodeIds are only valid within the DOM.getDocument call that produced them; reusing a nodeId across separate calls fails with 'Could not find node with given id'."""
     return _call("cdp", {"method": method, "params": params or {}}, session)
 
 
