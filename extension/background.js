@@ -367,13 +367,14 @@ function refOrSelector(args) {
 async function actClick(args, session) {
   const { tabId, frameId } = await contentTarget(session, args);
   const target = refOrSelector(args);
-  if (args.trusted) {
-    // trusted 模式：content.js 只负责定位和滚动，坐标交给 debugger 发真实输入事件
-    // 注意：CDP 坐标基于顶层视口，iframe 内元素的 trusted 点击坐标会偏移，
-    // iframe 场景请用非 trusted 点击（el.click() 不受此限）
-    const rect = await sendToContent(tabId, { kind: "coords", ...target }, frameId);
+  // 先解析坐标：content.js 会识别勾选类控件（自定义 checkbox/switch）并改返
+  // 可视方块的中心坐标；勾选控件一律走 trusted 通道，普通元素行为不变。
+  // 注意：CDP 坐标基于顶层视口，iframe 内元素的 trusted 点击坐标会偏移，
+  // iframe 场景请用非 trusted 点击（el.click() 不受此限）
+  const rect = await sendToContent(tabId, { kind: "coords", ...target }, frameId);
+  if (args.trusted || rect.checkable) {
     await trustedClickAt(tabId, rect.x, rect.y);
-    return { clicked: target, trusted: true, x: rect.x, y: rect.y };
+    return { clicked: target, trusted: true, x: rect.x, y: rect.y, ...(rect.checkable ? { checkable: true } : {}) };
   }
   return await sendToContent(tabId, { kind: "click", ...target }, frameId);
 }

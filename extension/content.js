@@ -1,5 +1,6 @@
 // AgentBridge content script
-// 职责：a11y 快照（@e refs）、元素定位/点击/填充、contenteditable 兼容、
+// 职责：a11y 快照（@e refs，含自定义 checkbox/switch 控件识别与状态推断）、
+// 元素定位/点击（勾选控件自动落可视方块）/填充、contenteditable 兼容、
 // 事件录制器（click/input/change/submit/Enter）、正文提取（text/markdown/dom）。
 // 运行在隔离世界，不受页面 CSP 影响。
 
@@ -67,6 +68,169 @@
   }
 
   // -------------------------------------------------------------------------
+  // 勾选类控件识别（自定义 checkbox/switch 组件）
+  // 自定义组件常把原生 input 隐藏、真实状态挂在 label/容器的 class 上，
+  // 标准 a11y 遍历既看不到控件也读不到状态，这里按多信号单独收集。
+  // -------------------------------------------------------------------------
+
+  const CHECKABLE_CLASS_RE = /checkbox|switch|toggle/i;
+  const GROUP_CLASS_RE = /group|list/i; // 容器 token（如 xxx-checkbox-group）不是单个控件
+  const STATE_CLASS_RE = /selected|checked|active/i;
+  const ON_TOKEN_RE = /(^|[-_])on([-_]|$)/i;
+
+  function classTokens(el) {
+    const cls = el.className;
+    if (typeof cls !== "string" || !cls) return [];
+    return cls.split(/\s+/).filter(Boolean);
+  }
+
+  function hasCheckableClass(el) {
+    return classTokens(el).some((t) => CHECKABLE_CLASS_RE.test(t) && !GROUP_CLASS_RE.test(t));
+  }
+
+  function hasStateClass(el) {
+    return classTokens(el).some((t) => STATE_CLASS_RE.test(t) || ON_TOKEN_RE.test(t));
+  }
+
+  // 元素若是勾选控件本体，返回 kind（checkbox/radio/switch），否则 null
+  function checkableKind(el) {
+    if (el.tagName === "INPUT") {
+      const t = (el.type || "").toLowerCase();
+      return t === "checkbox" || t === "radio" ? t : null;
+    }
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    if (role === "checkbox" || role === "switch" || role === "radio") return role;
+    if (hasCheckableClass(el)) {
+      return /switch|toggle/i.test(classTokens(el).join(" ")) ? "switch" : "checkbox";
+    }
+    return null;
+  }
+
+  // 原生 input 的控件根：向上最多 4 级找 label / 勾选类 class 的包装元素
+  function controlRootFor(el) {
+    if (el.tagName !== "INPUT") return el;
+    let cur = el.parentElement, depth = 0;
+    while (cur && depth < 4) {
+      if (cur.tagName === "LABEL" || checkableKind(cur)) return cur;
+      cur = cur.parentElement; depth++;
+    }
+    return el;
+  }
+
+  // el 是否可视为勾选控件根（含"label 包裹勾选 input"的常见结构）
+  function asCheckableRoot(el) {
+    if (checkableKind(el)) return controlRootFor(el);
+    if (el.tagName === "LABEL" && el.querySelector('input[type="checkbox"],input[type="radio"]')) return el;
+    return null;
+  }
+
+  // 收集页面全部勾选控件的根元素（Map: root → kind）
+  function collectCheckControls() {
+    const roots = new Map();
+    for (const el of walkElements(document.body)) {
+      let kind = null;
+      if (el.tagName === "INPUT") {
+        kind = checkableKind(el);
+      } else {
+        const role = (el.getAttribute("role") || "").toLowerCase();
+        if (role === "checkbox" || role === "switch" || role === "radio") {
+          kind = role;
+        } else if (hasCheckableClass(el)
+          && !el.querySelector('input[type="checkbox"],input[type="radio"],[role="checkbox"],[role="switch"],[role="radio"]')) {
+          // 纯 class 自定义控件：内部没有任何原生/ARIA 控件时才算，
+          // 避免把包装层和内层视觉方块重复收集
+          kind = /switch|toggle/i.test(classTokens(el).join(" ")) ? "switch" : "checkbox";
+        }
+      }
+      if (!kind) continue;
+      const root = controlRootFor(el);
+      if (roots.has(root)) continue;
+      // 跳过嵌套在已收集控件内部的内层元素（如视觉方块 span）
+      let nested = false;
+      for (const r of roots.keys()) {
+        if (r.contains(root)) { nested = true; break; }
+      }
+      if (!nested) roots.set(root, kind);
+    }
+    return roots;
+  }
+
+  // 勾选状态多信号判定：aria-checked > input.checked 与 class 一致 > 冲突时信 class
+  // （自定义组件的 input.checked 常是摆设，真实状态挂在 label/容器 class 上）
+  // inferred=true 表示该状态是推断值
+  function resolveCheckState(root) {
+    const input = root.tagName === "INPUT" ? root : root.querySelector('input[type="checkbox"],input[type="radio"]');
+    const ariaHolder = root.hasAttribute("aria-checked") ? root : root.querySelector("[aria-checked]");
+    if (ariaHolder) return { checked: ariaHolder.getAttribute("aria-checked") === "true", inferred: false };
+    let classOn = false;
+    const rels = [root, root.parentElement, root.parentElement && root.parentElement.parentElement, ...root.children];
+    for (const r of rels) {
+      if (r && hasStateClass(r)) { classOn = true; break; }
+    }
+    if (input) {
+      if (!!input.checked === classOn) return { checked: classOn, inferred: false };
+      return { checked: classOn, inferred: true }; // 信号冲突：信 class
+    }
+    return { checked: classOn, inferred: true };
+  }
+
+  // 从 click 目标元素定位所属勾选控件根：向上最多 4 级，向下仅在恰好包含
+  // 唯一控件时下钻。目标本身是 BUTTON/A 等原生交互元素时不向上接管，
+  // 避免误接管 label 内的 "?" 帮助按钮。
+  function findCheckableRoot(el) {
+    if (!el || !el.tagName) return null;
+    const self = asCheckableRoot(el);
+    if (self) return self;
+    if (!/^(BUTTON|A|SELECT|TEXTAREA)$/.test(el.tagName)) {
+      let cur = el.parentElement, depth = 0;
+      while (cur && cur !== document.body && depth < 4) {
+        const root = asCheckableRoot(cur);
+        if (root) return root;
+        cur = cur.parentElement; depth++;
+      }
+    }
+    if (el.querySelectorAll) {
+      const inner = el.querySelectorAll('input[type="checkbox"],input[type="radio"],[role="checkbox"],[role="switch"],[role="radio"]');
+      if (inner.length === 1) return controlRootFor(inner[0]);
+    }
+    return null;
+  }
+
+  // 选控件内部最像"可视方块"的小元素作为点击点：优先 input 的父级小元素
+  // （自定义组件常见结构），其次方形/近方形、无文本、≤48px 的后代元素，
+  // 避开文本和 tooltip 按钮
+  function pickCheckableClickTarget(root) {
+    const input = root.tagName === "INPUT" ? root : root.querySelector('input[type="checkbox"],input[type="radio"]');
+    if (input && input.parentElement && input.parentElement !== root && root.contains(input.parentElement)) {
+      const p = input.parentElement;
+      const r = p.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && r.width <= 48 && r.height <= 48 && !(p.innerText || "").trim()) return p;
+    }
+    if (input) {
+      const r = input.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && r.width <= 48 && r.height <= 48) return input;
+    }
+    let best = null, bestScore = -1;
+    for (const c of root.querySelectorAll("span,i,svg,div")) {
+      const r = c.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0 || r.width > 48 || r.height > 48) continue;
+      const ratio = r.width / r.height;
+      if (ratio < 0.5 || ratio > 2) continue;
+      if ((c.innerText || "").trim()) continue;
+      if (c.querySelector("button,a")) continue;
+      const score = (48 - Math.max(r.width, r.height)) / 48
+        + (c.tagName === "SPAN" || c.tagName === "I" ? 0.5 : 0)
+        - c.childElementCount * 0.01;
+      if (score > bestScore) { bestScore = score; best = c; }
+    }
+    if (best) return best;
+    // 根元素自身不大且不含按钮/链接时，点根本身
+    const rr = root.getBoundingClientRect();
+    if (rr.width > 0 && rr.width <= 64 && rr.height <= 48 && !root.querySelector("button,a")) return root;
+    return null;
+  }
+
+  // -------------------------------------------------------------------------
   // 深度遍历：TreeWalker 不穿透 shadow root，递归下钻 open shadow DOM
   // （closed shadow root 无法访问，属于平台限制）
   // -------------------------------------------------------------------------
@@ -89,13 +253,30 @@
     for (const el of walkElements(document.body)) {
       if (el.hasAttribute("data-ai-ref")) el.removeAttribute("data-ai-ref");
     }
+    const controls = collectCheckControls();
     const lines = [];
     const refs = [];
     let counter = 1;
+    let hasInferred = false;
 
     for (const node of walkElements(document.body)) {
       if (!isVisible(node)) continue;
+      const ctlKind = controls.get(node);
+      if (ctlKind) {
+        const name = getName(node);
+        if (!name && node.tagName !== "INPUT") continue;
+        const ref = "e" + counter++;
+        node.setAttribute("data-ai-ref", ref);
+        const st = resolveCheckState(node);
+        if (st.inferred) hasInferred = true;
+        const state = (st.checked ? "checked" : "unchecked") + (st.inferred ? "?" : "");
+        lines.push(`[ref=${ref}] ${ctlKind} "${name.replace(/\n/g, " ").substring(0, 120)}" [${state}]`);
+        refs.push({ ref, role: ctlKind, tag: node.tagName.toLowerCase(), name, checked: st.checked, inferred: st.inferred });
+        continue;
+      }
       const role = getRole(node);
+      // 被自定义包装（label 等）代表的勾选 input 不再单独列行，避免与控件根重复
+      if (node.tagName === "INPUT" && checkableKind(node) && controlRootFor(node) !== node) continue;
       const interactive = INTERACTIVE_TAGS.has(node.tagName) || INTERACTIVE_ROLES.has(role);
       if (!interactive) continue;
       const name = getName(node);
@@ -108,6 +289,7 @@
       lines.push(`[ref=${ref}] ${role}${typeAttr} "${name.replace(/\n/g, " ").substring(0, 120)}"${valueAttr}`);
       refs.push({ ref, role, tag: node.tagName.toLowerCase(), name });
     }
+    if (hasInferred) lines.push("（勾选状态带 ? 为多信号推断值）");
     return { snapshot: lines.join("\n"), element_count: refs.length, url: location.href, title: document.title };
   }
 
@@ -346,12 +528,21 @@
           case "snapshot": result = buildSnapshot(); break;
           case "click": {
             const el = resolveEl(msg);
-            el.scrollIntoView({ behavior: "instant", block: "center" });
-            el.click();
-            result = { clicked: msg.ref ? "@" + msg.ref : msg.selector, trusted: false };
+            const root = findCheckableRoot(el);
+            // 勾选类控件落到可视方块上点，避免落在文本或 tooltip 按钮上
+            const target = root ? (pickCheckableClickTarget(root) || root) : el;
+            target.scrollIntoView({ behavior: "instant", block: "center" });
+            target.click();
+            result = { clicked: msg.ref ? "@" + msg.ref : msg.selector, trusted: false, ...(root ? { checkable: true } : {}) };
             break;
           }
-          case "coords": result = centerCoords(resolveEl(msg)); break;
+          case "coords": {
+            const el = resolveEl(msg);
+            const root = findCheckableRoot(el);
+            const target = root ? (pickCheckableClickTarget(root) || root) : el;
+            result = { ...centerCoords(target), ...(root ? { checkable: true } : {}) };
+            break;
+          }
           case "focus": { const el = resolveEl(msg); el.scrollIntoView({ behavior: "instant", block: "center" }); el.focus(); result = { focused: true }; break; }
           case "fill": result = fillElement(resolveEl(msg), msg.value); break;
           case "select": {
