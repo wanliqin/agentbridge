@@ -106,8 +106,10 @@ class AgentBridgeError(Exception):
 
 async def ws_handler(ws) -> None:
     """扩展接入：校验 token + browser_id，之后只收命令回包。"""
-    # websockets 15 新 API：握手信息在 ws.request（Request 对象）上
-    query = urllib.parse.parse_qs(urllib.parse.urlparse(ws.request.path).query)
+    # websockets ≥12 新 API 握手信息在 ws.request.path；旧版（≤11 legacy）在 ws.path
+    req = getattr(ws, "request", None)
+    path = getattr(req, "path", None) or getattr(ws, "path", "/")
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
     token = (query.get("token") or [""])[0]
     if token != TOKEN:
         log.warning("WS 拒绝：token 错误，来自 %s", ws.remote_address)
